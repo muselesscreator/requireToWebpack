@@ -1,0 +1,141 @@
+#!/usr/bin/python
+
+from datetime import datetime
+import os
+import sys
+import time
+import argparse
+import re
+import json
+
+class RequireJSConverter(object):
+    def __init__(self, path, externals):
+        self._path = path
+        self._externals_path = externals
+        self._raw_lines = []
+        self._joined_content = None;
+
+    @property
+    def path(self):
+        return self._path;
+
+    @property
+    def lines(self):
+        return [line.strip() for line in self._raw_lines]
+
+    @property
+    def joined_content(self):
+        if self._joined_content is None:
+            self._joined_content = ''.join(self._raw_lines)
+        return self._joined_content;
+
+    def load_file(self):
+        with open(self.path, 'r') as fs:
+            self._raw_lines = [line for line in fs.readlines()]
+
+    def load_start_content(self):
+        content = ''
+        rows = []
+        for row_num, row in enumerate(self.lines):
+            if row.startswith('/') or row.startswith('*'):
+                continue
+            rows.append(row_num);
+            content = '{}{}'.format(content, row)
+            if re.search('.*\(function\(.*\)\s*\{', content):
+                break
+        self._start_block = { 'content': content, 'rows': rows }
+
+    def load_imports(self):
+        content = ''
+        rows = []
+        entries = []
+        match = None
+
+        
+        offset = self._start_block['rows'][-1] + 1
+        for row_num, row in enumerate(self.lines[offset+1:]):
+            if row.startswith('/') or row.startswith('*'):
+                continue
+            rows.append(row_num + offset + 1);
+            content = '{}{}'.format(content, row)
+            quotesGroup = '["\']'
+            query = '.*define\(\[(.*)\], function\((.*)\)'
+            match = re.search(query, content)
+            if match:
+                break
+
+        self._import_rows = rows
+        self._imports = []
+
+        if self._externals_path:
+            with open(self._externals_path, 'r') as fs:
+                externals = json.load(fs)['externals'];
+
+        if match:
+            groups = list(match.groups());
+            import_paths = [string.replace("'", "") for string in groups[0].split(',')]
+            imported = [string.strip() for string in groups[1].split(',')]
+            for import_index, path in enumerate(import_paths):
+                if path not in externals:
+                    self._imports.append(
+                            "import {0} from '{1}';\n".format(imported[import_index], path))
+
+    def load_end_content(self):
+        content = ''
+        rows = []
+        for row_num, row in enumerate(self.lines[::-1]):
+            rows.append(len(self.lines) - row_num);
+            content = '{}{}'.format(row, content)
+            if re.search('.*\}\);\s*\}\).call\(', content):
+                break
+
+        self._end_block = { 'content': content, 'rows': rows }
+
+    def load_output(self):
+        self._window_rows = [row for row in self.lines if 'window.' in row]
+        self._return_row = [row for row in self.lines[::-1] if 'return' in row][-1]
+
+    def load_content(self):
+        start = self._import_rows[-1]
+        end = self._end_block['rows'][-1] - 1
+        content = [self._raw_lines[r] for r in xrange(start + 1, end)]
+        indent = len(content[0]) - len(content[0].lstrip(' '))
+        self._content = [line[indent:] for line in content]
+
+        match = re.search(r'\s*return (\w+);\s*', self._content[-1])
+        if match:
+            self._content[-1] = 'export default {0};'.format(match.groups()[0])
+
+    def write_new(self):
+        out = []
+        out += [self._raw_lines[r] for r in xrange(0, self._start_block['rows'][0])]
+        out += self._imports
+        out += ['\n']
+        out += self._content
+
+        fn = self._path + '.conv'
+        print "Output file: {0}".format(fn)
+        with open(fn, 'w') as fs:
+            fs.writelines(out)
+
+    def run(self):
+        self.load_file()
+
+        self.load_start_content()
+        self.load_imports();
+        self.load_end_content();
+        self.load_content()
+
+        self.write_new()
+
+
+if __name__=="__main__":
+    parser = argparse.ArgumentParser(
+            description='RequireJS to Webpack converter'
+    )
+    parser.add_argument('-p', '--path', dest='p', help='target file path', required=True);
+    parser.add_argument('-e', '--externals', dest='ext', help='externals filepath')
+    args = parser.parse_args();
+
+    converter = RequireJSConverter(args.p, args.ext)
+    converter.run()
